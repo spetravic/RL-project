@@ -13,6 +13,7 @@ import random
 import os
 import wandb
 import tqdm
+import math
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -25,17 +26,25 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(Agent, self).__init__()
+        
+        self.state_space = state_dim
+        self. action_space = action_dim
+        self.hidden = 64
+        self.sigma = np.sqrt(2)
+
 
         # TODO: Define the critic network and actor_mean. Both of them have two hidden layers with size 64 and use tanh() activation function.
         # Hint: We use the orthognoal initialization for the weight and constant for the bias. You can call layer_init(nn.Linear(dim1, dim2), std) to correctly init the nn.
         # Hint: When initializing neural networks, you can use the default std. 
         #       But for the last layer of critic, set std=1. And for the last layer of actor_mean, set std=0.01. 
         #       actor_logstd should be a learnable value as in previous assignments, and its initial value is 0
-        self.critic = 
-        
-        self.actor_mean = 
 
-        self.actor_logstd = 
+        self.critic = nn.Sequential(layer_init(nn.Linear(self.state_space, self.hidden)),nn.Tanh(),layer_init(nn.Linear(self.hidden, self.hidden)),nn.Tanh(),layer_init(nn.Linear(self.hidden, 1), 1.))
+
+        self.actor_mean = nn.Sequential(layer_init(nn.Linear(self.state_space, self.hidden)),nn.Tanh(),layer_init(nn.Linear(self.hidden, self.hidden)),nn.Tanh(),layer_init(nn.Linear(self.hidden, self.action_space), 0.01))
+        
+
+        self.actor_logstd = nn.Parameter(torch.zeros(1,self.action_space)) # we need one vector of 1 column and dim action_space full of 0s
 
     def get_action(self, x, action=None):
         action_mean = self.actor_mean(x)
@@ -45,6 +54,7 @@ class Agent(nn.Module):
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1)
+        # entropy - for ppo you gotta compute the entropy
 
     def get_value(self, x):
         return self.critic(x).squeeze(-1) # return shape (batch, )
@@ -95,7 +105,7 @@ class PPOBuffer(object):
 
         self.states[self.ptr] = state.cpu().numpy() if isinstance(state, torch.Tensor) else state
         self.actions[self.ptr] = action.cpu().numpy() if isinstance(action, torch.Tensor) else action
-        self.rewards[self.ptr] = reward
+        self.rewards[self.ptr] = reward.cpu().numpy() if isinstance(reward, torch.Tensor) else reward
         self.start_episodes[self.ptr] = start_episode
         self.values[self.ptr] = value.cpu().numpy() if isinstance(action, torch.Tensor) else value
         self.logprobs[self.ptr] = logprob.cpu().numpy() if isinstance(action, torch.Tensor) else logprob
@@ -111,6 +121,31 @@ class PPOBuffer(object):
         # Hint: https://www.davidsilver.uk/wp-content/uploads/2020/03/MC-TD.pdf should be helpful
         #       Page 47 (Telescoping in TD(\lambda)) shows how to calculate returns $G^{\lambda}_t$.
         #       Also notice that in this page, $G^{\lambda}t - V(s_t)$ equals to the equation (11) in the PPO paper
+        returns = []
+        gaes = 0.0
+        timesteps = self.buffer_size
+        #print(self.rewards.shape)
+        #print(self.values.shape)
+        for t in range(timesteps-1, -1, -1):
+            if t == timesteps-1:
+            	last_value = last_value.cpu().numpy() if isinstance(last_value,torch.Tensor) else last_value
+            	deltas = self.rewards[t] + self.gamma * last_value * (1-done) - self.values[t]
+            	gaes = deltas + self.gamma*self.gae_lambda*(1-done)*gaes
+            	
+            else:
+            	deltas = self.rewards[t] + self.gamma * self.values[t+1] *\
+                     (1-self.start_episodes[t+1]) - self.values[t]
+            	gaes = deltas + self.gamma*self.gae_lambda*(1-self.start_episodes[t+1])*gaes
+            self.advantages[t] = gaes
+            	
+            returns.append(gaes + self.values[t])
+        
+           
+        self.returns = np.array(returns[::-1])
+        #self.advantages = np.array(list(reversed(self.advantages)))
+        #print(self.returns.shape)
+        
+
 
 
 
@@ -205,8 +240,14 @@ class PPO(object):
             # Hint: Notice the type of a variable. Is it a numpy, a tenser on CPU or a tensor on GPU?
             # Hint: We use gym.wrappers.RecordEpisodeStatistics(env) to automatically reset env at the end of one episode. See make_env().
             # Hint: Call self.buffer.add() to fill needed varialbes into buffer.
-
-
+            
+            actions, logprobs, _ = self.agent.get_action(torch.tensor(self.states))  # make self.states a tensor
+            values = self.agent.get_value(torch.tensor(self.states)).detach() # same here
+            states = self.states
+            start_episodes = self.start_episodes
+            self.states, rewards, self.start_episodes, infos = envs.step(actions) # IS THIS envs or env
+            self.buffer.add(states, actions.detach(), rewards, start_episodes, values, logprobs.detach())
+            
 
 
             # Unlike TD3, in PPO, we didn't process the done flag when episode_timesteps == env._max_episode_steps,
@@ -228,6 +269,7 @@ class PPO(object):
         for epoch in range(self.update_epochs):
             for data in self.buffer.get(self.mini_batch_size): 
                 states, actions, logprobs, returns, advantages = data 
+                #print(advantages)
 
                 # calculate the loss and update the weights of nn
                 # TODO: Implement the loss according to eq (7)(9) in https://arxiv.org/pdf/1707.06347.pdf 
@@ -238,10 +280,25 @@ class PPO(object):
                 # Hint: self.agent.get_value() returns new_values
 
                 # 1. complete the missing losses: pg_loss, entropy_loss and v_loss
+                values = self.agent.get_value(states)
+                _,new_logprobs,entropy = self.agent.get_action(states, actions)
                 
+                ratio = (new_logprobs - logprobs).exp()
+                
+                v_loss = F.mse_loss(values,returns.float())
+                pg_loss = -1.0*(ratio * advantages)
+                clp = -1.0*torch.clamp(ratio, min=1-self.clip_ratio, max=1+self.clip_ratio) * advantages
+                pg_loss = torch.max(pg_loss, clp).mean()
+                entropy_loss = entropy.mean()
+                
+                # we changed all the signs bcs in python we maximize
+                # by doing gradient descent
                 loss = pg_loss - self.ent_coef * entropy_loss + self.vf_coef * v_loss
 
                 # 2. update weights with self.optimizer
+                self.optimizer.zero_grad()
+                loss.mean().backward()
+                self.optimizer.step()
 
 
                 # stats
