@@ -216,9 +216,9 @@ class TD3(object):
 
             Q = self.critic.forward(state, self.actor(state))[0]
             l = self.alpha / torch.abs(Q).mean().detach() # eq. 5 in the paper
-
+            
             actor_loss = - (l * Q.mean() - MSE(self.actor(state), action)) # eq. 3 in the paper
-
+            
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             self.actor_optimizer.step()
@@ -283,6 +283,7 @@ if __name__ == "__main__":
     parser.add_argument("--ratio", default=1, type=float,
                         help="Percentage of data")
     parser.add_argument("--dataset", default="halfcheetah_mixed.pickle")
+    parser.add_argument("--no_normalisation", action="store_true")
     
     
     args = parser.parse_args()
@@ -327,7 +328,11 @@ if __name__ == "__main__":
 
     replay_buffer.use_offline_data(data_ratio)
     
-    mean, std = replay_buffer.normalization()
+    if args.no_normalisation:
+        mean = 0
+        std = 1
+    else:
+        mean, std = replay_buffer.normalization()
 
     # init td3
     td3_kwargs = {
